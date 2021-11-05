@@ -43,6 +43,29 @@ const int dx10[10] = {-1, 0, 1, 0, -1, 1, 1, -1, 0, 0};
 const int dy10[10] = {0, -1, 0, 1, -1, -1, 1, 1, 0, 0};
 const int dz10[10] = {0, 0, 0, 0, 0, 0, 0, 0, -1, 1};
 
+#if _OPENMP
+struct my_max
+{
+	template <class T>
+	const T &operator()(const T &a, const T &b) const
+	{
+		return std::max(a, b);
+	}
+};
+#pragma omp declare reduction(vec_double_sum                                                                                           \
+							  : std::vector <double>                                                                                   \
+							  : std::transform(omp_out.begin(), omp_out.end(), omp_in.begin(), omp_out.begin(), std::plus <double>())) \
+	initializer(omp_priv = decltype(omp_orig)(omp_orig.size()))
+#pragma omp declare reduction(vec_double_max                                                                               \
+							  : std::vector <double>                                                                       \
+							  : std::transform(omp_out.begin(), omp_out.end(), omp_in.begin(), omp_out.begin(), my_max())) \
+	initializer(omp_priv = decltype(omp_orig)(omp_orig.size()))
+#pragma omp declare reduction(vec_int_sum                                                                                           \
+							  : std::vector <int>                                                                                   \
+							  : std::transform(omp_out.begin(), omp_out.end(), omp_in.begin(), omp_out.begin(), std::plus <int>())) \
+	initializer(omp_priv = decltype(omp_orig)(omp_orig.size()))
+#endif
+
 //////////////////////////////////////////////////////////////////////
 // Construction/Destruction
 //////////////////////////////////////////////////////////////////////
@@ -443,35 +466,51 @@ void SLIC::PerformSuperpixelSegmentation_VariableSandM(
 	vector<double> sigmax(numk, 0);
 	vector<double> sigmay(numk, 0);
 	vector<int> clustersize(numk, 0);
-	vector<double> inv(numk, 0); //to store 1/clustersize[k] values
-	vector<double> distxy(sz, DBL_MAX);
-	vector<double> distlab(sz, DBL_MAX);
-	vector<double> distvec(sz, DBL_MAX);
-	vector<double> maxlab(numk, 10 * 10);	 //THIS IS THE VARIABLE VALUE OF M, just start with 10
-	vector<double> maxxy(numk, STEP * STEP); //THIS IS THE VARIABLE VALUE OF M, just start with 10
+	vector<double> inv(numk, 0);   //to store 1/clustersize[k] values
+	auto distlab = new double[sz]; // Do not init, and do not use vector
+	// vector<double> distvec(sz, DBL_MAX);
+	auto distvec = new double[sz];		  // Do not init, and do not use vector
+	vector<double> maxlab(numk, 10 * 10); //THIS IS THE VARIABLE VALUE OF M, just start with 10
 
 	double invxywt = 1.0 / (STEP * STEP); //NOTE: this is different from how usual SLIC/LKM works
 
 	while (numitr < NUMITR)
 	{
 		//------
-		//cumerr = 0;
 		numitr++;
 		//------
 
-		distvec.assign(sz, DBL_MAX);
-		for (int n = 0; n < numk; n++)
-		{
-			int y1 = max(0, (int)(kseedsy[n] - offset));
-			int y2 = min(m_height, (int)(kseedsy[n] + offset));
-			int x1 = max(0, (int)(kseedsx[n] - offset));
-			int x2 = min(m_width, (int)(kseedsx[n] + offset));
+		vector<double> maxlab_old(maxlab);
+
 #if _OPENMP
-#pragma omp parallel for simd
+#pragma omp parallel for reduction(vec_double_sum                                                                              \
+								   : sigmal, sigmaa, sigmab, sigmax, sigmay) reduction(vec_int_sum                             \
+																					   : clustersize) reduction(vec_double_max \
+																												: maxlab)
 #endif
-			for (int y = y1; y < y2; y++)
+		for (int y = 0; y < m_height; y++)
+		{
+			int cnt = 0;
+			cnt++;
+			for (int x = 0; x < m_width; x++)
 			{
-#pragma GCC ivdep
+				int i = y * m_width + x;
+				distvec[i] = DBL_MAX;
+			}
+			for (int n = 0; n < numk; n++)
+			{
+				// Abort if out of range
+				if (!((int)(kseedsy[n] - offset) <= y && y < (int)(kseedsy[n] + offset)))
+				{
+					continue;
+				}
+
+				const int x1 = max(0, (int)(kseedsx[n] - offset));
+				const int x2 = min(m_width, (int)(kseedsx[n] + offset));
+				const double inv_maxlab = 1 / maxlab_old[n];
+				const double cons_kseedsl = kseedsl[n];
+				const double cons_y = (y - kseedsy[n]) * (y - kseedsy[n]);
+
 				for (int x = x1; x < x2; x++)
 				{
 					int i = y * m_width + x;
@@ -481,91 +520,76 @@ void SLIC::PerformSuperpixelSegmentation_VariableSandM(
 					double a = m_avec[i];
 					double b = m_bvec[i];
 
-					distlab[i] = (l - kseedsl[n]) * (l - kseedsl[n]) +
+					distlab[i] = (l - cons_kseedsl) * (l - cons_kseedsl) +
 								 (a - kseedsa[n]) * (a - kseedsa[n]) +
 								 (b - kseedsb[n]) * (b - kseedsb[n]);
-
-					double distxy = (x - kseedsx[n]) * (x - kseedsx[n]) +
-									(y - kseedsy[n]) * (y - kseedsy[n]);
+					// }
+					// for (int x = x1; x < x2; x++)
+					// {
+					// 	int i = y * m_width + x;
+					double distxy = (x - kseedsx[n]) * (x - kseedsx[n]) + cons_y;
 
 					//------------------------------------------------------------------------
-					double dist = distlab[i] / maxlab[n] + distxy * invxywt; //only varying m, prettier superpixels
-					//double dist = distlab[i]/maxlab[n] + distxy[i]/maxxy[n];//varying both m and S
-					//------------------------------------------------------------------------
+					double dist = distlab[i] * inv_maxlab + distxy * invxywt; //only varying m, prettier superpixels
+																			  //------------------------------------------------------------------------
 
-					if (dist < distvec[i])
+					if ((cnt == 1 && n == 0) || dist < distvec[i])
 					{
 						distvec[i] = dist;
 						klabels[i] = n;
 					}
 				}
 			}
-		}
-		//-----------------------------------------------------------------
-		// Assign the max color distance for a cluster
-		//-----------------------------------------------------------------
-		if (0 == numitr)
-		{
-			maxlab.assign(numk, 1);
-			maxxy.assign(numk, 1);
-		}
-		{
-#if _OPENMP
-#pragma omp parallel for simd
-#endif
-			for (int i = 0; i < sz; i++)
+
+			for (int x = 0; x < m_width; x++)
 			{
-				if (maxlab[klabels[i]] < distlab[i])
-					maxlab[klabels[i]] = distlab[i];
-				if (maxxy[klabels[i]] < distxy[i])
-					maxxy[klabels[i]] = distxy[i];
-			}
-		}
-		//-----------------------------------------------------------------
-		// Recalculate the centroid and store in the seed values
-		//-----------------------------------------------------------------
-		sigmal.assign(numk, 0);
-		sigmaa.assign(numk, 0);
-		sigmab.assign(numk, 0);
-		sigmax.assign(numk, 0);
-		sigmay.assign(numk, 0);
-		clustersize.assign(numk, 0);
+				//-----------------------------------------------------------------
+				// Assign the max color distance for a cluster
+				//-----------------------------------------------------------------
+				int i = y * m_width + x;
+				int idx = klabels[i];
+				if (numitr == 0 && cnt == 1)
+				{
+					maxlab[idx] = 1;
+				}
+				if (maxlab[idx] < distlab[i])
+					maxlab[idx] = distlab[i];
+				// distvec[i] = DBL_MAX;
+				//-----------------------------------------------------------------
+				// Recalculate the centroid and store in the seed values
+				//-----------------------------------------------------------------
 
-#if _OPENMP
-#pragma omp parallel for simd
-#endif
-		for (int j = 0; j < sz; j++)
-		{
-			int temp = klabels[j];
-			//_ASSERT(klabels[j] >= 0);
-			sigmal[klabels[j]] += m_lvec[j];
-			sigmaa[klabels[j]] += m_avec[j];
-			sigmab[klabels[j]] += m_bvec[j];
-			sigmax[klabels[j]] += (j % m_width);
-			sigmay[klabels[j]] += (j / m_width);
+				//_ASSERT(klabels[j] >= 0);
+				sigmal[idx] += m_lvec[i];
+				sigmaa[idx] += m_avec[i];
+				sigmab[idx] += m_bvec[i];
+				sigmax[idx] += x;
+				sigmay[idx] += y;
 
-			clustersize[klabels[j]]++;
-		}
-
-		{
-			for (int k = 0; k < numk; k++)
-			{
-				//_ASSERT(clustersize[k] > 0);
-				if (clustersize[k] <= 0)
-					clustersize[k] = 1;
-				inv[k] = 1.0 / double(clustersize[k]); //computing inverse now to multiply, than divide later
+				clustersize[idx]++;
 			}
 		}
 
+		for (int k = 0; k < numk; k++)
 		{
-			for (int k = 0; k < numk; k++)
-			{
-				kseedsl[k] = sigmal[k] * inv[k];
-				kseedsa[k] = sigmaa[k] * inv[k];
-				kseedsb[k] = sigmab[k] * inv[k];
-				kseedsx[k] = sigmax[k] * inv[k];
-				kseedsy[k] = sigmay[k] * inv[k];
-			}
+			//_ASSERT(clustersize[k] > 0);
+			// if (clustersize[k] <= 0)
+			// 	clustersize[k] = 1;
+			inv[k] = 1.0 / double(clustersize[k]); //computing inverse now to multiply, than divide later
+
+			kseedsl[k] = sigmal[k] * inv[k];
+			kseedsa[k] = sigmaa[k] * inv[k];
+			kseedsb[k] = sigmab[k] * inv[k];
+			kseedsx[k] = sigmax[k] * inv[k];
+			kseedsy[k] = sigmay[k] * inv[k];
+
+			// Reset
+			sigmal[k] = 0;
+			sigmaa[k] = 0;
+			sigmab[k] = 0;
+			sigmax[k] = 0;
+			sigmay[k] = 0;
+			clustersize[k] = 0;
 		}
 	}
 }

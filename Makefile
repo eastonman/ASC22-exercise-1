@@ -1,5 +1,5 @@
 CC=icc
-CPPFLAGS= -Iinclude --std=c++11 -Ofast -axCORE-AVX2 -march=core-avx2 -mtune=core-avx2 -pthread -qopenmp -fma -static-libgcc -static-libstdc++ -stdlib=libc++
+CPPFLAGS= -Iinclude --std=c++11 -Ofast -axCORE-AVX2 -march=core-avx2 -mtune=core-avx2 -pthread -qopenmp -qopenmp-link=static -fma -ipo -static-libgcc -static-libstdc++ -stdlib=libc++
 
 .PHONY: default main SLIC
 
@@ -7,7 +7,7 @@ default: SLIC main
 	$(CC) $(CPPFLAGS) main.o src/SLIC.o -o main
 
 run: default
-	./main
+	OMP_NUM_THREADS=20 ./main
 
 perf: default
 	perf record ./main
