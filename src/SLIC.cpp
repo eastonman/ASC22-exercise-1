@@ -29,6 +29,7 @@
 #include "SLIC.h"
 #include <chrono>
 #include <immintrin.h>
+#include <cstring>
 
 typedef std::chrono::high_resolution_clock Clock;
 
@@ -200,6 +201,7 @@ void SLIC::RGB2LAB(const int &sR, const int &sG, const int &sB, double &lval, do
 ///
 ///	For whole image: overlaoded floating point version
 //===========================================================================
+#pragma intel optimize("opt-streaming-stores", on)
 void SLIC::DoRGBtoLABConversion(
 	const unsigned int *&ubuff,
 	double *&lvec,
@@ -210,6 +212,9 @@ void SLIC::DoRGBtoLABConversion(
 	lvec = new double[sz];
 	avec = new double[sz];
 	bvec = new double[sz];
+// #pragma prefetch rgb_lut : 2 : 256
+// #pragma prefetch rgb_pow_lut : 2 : 256
+// #pragma prefetch ubuff : 1 : 16
 #if _OPENMP
 #pragma omp parallel for simd
 #endif
@@ -291,7 +296,8 @@ void SLIC::DetectLabEdges(
 {
 	int sz = width * height;
 
-	edges.resize(sz, 0);
+	edges.resize(sz);
+#pragma omp parallel for simd
 	for (int j = 1; j < height - 1; j++)
 	{
 		for (int k = 1; k < width - 1; k++)
@@ -310,6 +316,23 @@ void SLIC::DetectLabEdges(
 			edges[i] = (dx + dy);
 		}
 	}
+}
+double SLIC::DetectLABPixelEdge(
+	const int &i)
+{
+	const double *lvec = m_lvec;
+	const double *avec = m_avec;
+	const double *bvec = m_bvec;
+	const int width = m_width;
+
+	double dx = (lvec[i - 1] - lvec[i + 1]) * (lvec[i - 1] - lvec[i + 1]) +
+				(avec[i - 1] - avec[i + 1]) * (avec[i - 1] - avec[i + 1]) +
+				(bvec[i - 1] - bvec[i + 1]) * (bvec[i - 1] - bvec[i + 1]);
+
+	double dy = (lvec[i - width] - lvec[i + width]) * (lvec[i - width] - lvec[i + width]) +
+				(avec[i - width] - avec[i + width]) * (avec[i - width] - avec[i + width]) +
+				(bvec[i - width] - bvec[i + width]) * (bvec[i - width] - bvec[i + width]);
+	return dx + dy;
 }
 
 //===========================================================================
@@ -343,7 +366,7 @@ void SLIC::PerturbSeeds(
 			if (nx >= 0 && nx < m_width && ny >= 0 && ny < m_height)
 			{
 				int nind = ny * m_width + nx;
-				if (edges[nind] < edges[storeind])
+				if (DetectLABPixelEdge(nind) < DetectLABPixelEdge(storeind))
 				{
 					storeind = nind;
 				}
@@ -473,6 +496,14 @@ void SLIC::PerformSuperpixelSegmentation_VariableSandM(
 	vector<double> maxlab(numk, 10 * 10); //THIS IS THE VARIABLE VALUE OF M, just start with 10
 
 	double invxywt = 1.0 / (STEP * STEP); //NOTE: this is different from how usual SLIC/LKM works
+	const int width = m_width;			  // Allow compiler to vectorize code
+
+	// for (auto seed : kseedsy)
+	// {
+	// 	std::cout << seed << " ";
+	// }
+	// std::cout << std::endl;
+	// std::cout << kseedsy.size() << std::endl;
 
 	while (numitr < NUMITR)
 	{
@@ -483,15 +514,16 @@ void SLIC::PerformSuperpixelSegmentation_VariableSandM(
 		vector<double> maxlab_old(maxlab);
 
 #if _OPENMP
-#pragma omp parallel for reduction(vec_double_sum                                                                              \
-								   : sigmal, sigmaa, sigmab, sigmax, sigmay) reduction(vec_int_sum                             \
-																					   : clustersize) reduction(vec_double_max \
-																												: maxlab)
+#pragma omp parallel for schedule(guided) reduction(vec_double_sum                                                                              \
+													: sigmal, sigmaa, sigmab, sigmax, sigmay) reduction(vec_int_sum                             \
+																										: clustersize) reduction(vec_double_max \
+																																 : maxlab)
 #endif
 		for (int y = 0; y < m_height; y++)
 		{
 			int cnt = 0;
 			cnt++;
+
 			for (int x = 0; x < m_width; x++)
 			{
 				int i = y * m_width + x;
@@ -509,34 +541,33 @@ void SLIC::PerformSuperpixelSegmentation_VariableSandM(
 				const int x2 = min(m_width, (int)(kseedsx[n] + offset));
 				const double inv_maxlab = 1 / maxlab_old[n];
 				const double cons_kseedsl = kseedsl[n];
+				const double cons_kseedsa = kseedsa[n];
+				const double cons_kseedsb = kseedsb[n];
+				const double cons_kseedsx = kseedsx[n];
 				const double cons_y = (y - kseedsy[n]) * (y - kseedsy[n]);
-
+#pragma prefetch distvec : 2 : 4
 				for (int x = x1; x < x2; x++)
 				{
-					int i = y * m_width + x;
-					//_ASSERT( y < m_height && x < m_width && y >= 0 && x >= 0 );
+					int i = y * width + x;
+					// _ASSERT(y < m_height && x < m_width && y >= 0 && x >= 0);
 
 					double l = m_lvec[i];
 					double a = m_avec[i];
 					double b = m_bvec[i];
 
 					distlab[i] = (l - cons_kseedsl) * (l - cons_kseedsl) +
-								 (a - kseedsa[n]) * (a - kseedsa[n]) +
-								 (b - kseedsb[n]) * (b - kseedsb[n]);
-					// }
-					// for (int x = x1; x < x2; x++)
-					// {
-					// 	int i = y * m_width + x;
-					double distxy = (x - kseedsx[n]) * (x - kseedsx[n]) + cons_y;
+								 (a - cons_kseedsa) * (a - cons_kseedsa) +
+								 (b - cons_kseedsb) * (b - cons_kseedsb);
+					double distxy = (x - cons_kseedsx) * (x - cons_kseedsx) + cons_y;
 
 					//------------------------------------------------------------------------
 					double dist = distlab[i] * inv_maxlab + distxy * invxywt; //only varying m, prettier superpixels
 																			  //------------------------------------------------------------------------
 
-					if ((cnt == 1 && n == 0) || dist < distvec[i])
+					if (dist < distvec[i])
 					{
-						distvec[i] = dist;
 						klabels[i] = n;
+						distvec[i] = dist;
 					}
 				}
 			}
@@ -546,7 +577,7 @@ void SLIC::PerformSuperpixelSegmentation_VariableSandM(
 				//-----------------------------------------------------------------
 				// Assign the max color distance for a cluster
 				//-----------------------------------------------------------------
-				int i = y * m_width + x;
+				int i = y * width + x;
 				int idx = klabels[i];
 				if (numitr == 0 && cnt == 1)
 				{
@@ -569,7 +600,6 @@ void SLIC::PerformSuperpixelSegmentation_VariableSandM(
 				clustersize[idx]++;
 			}
 		}
-
 		for (int k = 0; k < numk; k++)
 		{
 			//_ASSERT(clustersize[k] > 0);
@@ -634,7 +664,7 @@ void SLIC::SaveSuperpixelLabels2PPM(
 
 	delete[] rgb;
 
-	fclose(fp);
+	std::fclose(fp);
 }
 
 //===========================================================================
@@ -770,13 +800,9 @@ void SLIC::PerformSLICO_ForGivenK(
 	m_height = height;
 	int sz = m_width * m_height;
 	//--------------------------------------------------
-	//if(0 == klabels) klabels = new int[sz];
-	for (int s = 0; s < sz; s++)
-		klabels[s] = -1;
 
 	//--------------------------------------------------
 	// RGB2LAB
-
 	// Init LUT
 	for (size_t i = 0; i < 256; i++)
 	{
@@ -791,31 +817,45 @@ void SLIC::PerformSLICO_ForGivenK(
 		DoRGBtoLABConversion(ubuff, m_lvec, m_avec, m_bvec);
 		auto endTime = Clock::now();
 		auto compTime = chrono::duration_cast<chrono::microseconds>(endTime - startTime);
-		cout << "RGB2LAB Conversion time=" << compTime.count() / 1000 << " ms" << endl;
+		std::cout << "RGB2LAB Conversion time: " << (double)compTime.count() / 1000 << " ms" << endl;
 	}
 
 	//--------------------------------------------------
 
 	bool perturbseeds(true);
 	vector<double> edgemag(0);
-	if (perturbseeds)
-		DetectLabEdges(m_lvec, m_avec, m_bvec, m_width, m_height, edgemag);
-	GetLABXYSeeds_ForGivenK(kseedsl, kseedsa, kseedsb, kseedsx, kseedsy, K, perturbseeds, edgemag);
+	// if (perturbseeds)
+	// {
 
-	int STEP = sqrt(double(sz) / double(K)) + 2.0; //adding a small value in the even the STEP size is too small.
+	// 	auto startTime = Clock::now();
+	// 	DetectLabEdges(m_lvec, m_avec, m_bvec, m_width, m_height, edgemag);
+	// 	auto endTime = Clock::now();
+	// 	auto compTime = chrono::duration_cast<chrono::microseconds>(endTime - startTime);
+	// 	std::cout << "DetectLabEdges time: " << (double)compTime.count() / 1000 << " ms" << endl;
+	// }
 	auto startTime = Clock::now();
-	PerformSuperpixelSegmentation_VariableSandM(kseedsl, kseedsa, kseedsb, kseedsx, kseedsy, klabels, STEP, 10);
+	GetLABXYSeeds_ForGivenK(kseedsl, kseedsa, kseedsb, kseedsx, kseedsy, K, perturbseeds, edgemag);
 	auto endTime = Clock::now();
 	auto compTime = chrono::duration_cast<chrono::microseconds>(endTime - startTime);
-	cout << "SuperpixelSegmentation time=" << compTime.count() / 1000 << " ms" << endl;
+	std::cout << "GetLABXYSeeds time: " << (double)compTime.count() / 1000 << " ms" << endl;
+
+	int STEP = sqrt(double(sz) / double(K)) + 2.0; //adding a small value in the even the STEP size is too small.
+	startTime = Clock::now();
+	PerformSuperpixelSegmentation_VariableSandM(kseedsl, kseedsa, kseedsb, kseedsx, kseedsy, klabels, STEP, 10);
+	endTime = Clock::now();
+	compTime = chrono::duration_cast<chrono::microseconds>(endTime - startTime);
+	std::cout << "SuperpixelSegmentation time=" << compTime.count() / 1000 << " ms" << endl;
 	numlabels = kseedsl.size();
 
 	int *nlabels = new int[sz];
+	startTime = Clock::now();
 	EnforceLabelConnectivity(klabels, m_width, m_height, nlabels, numlabels, K);
 	{
-		for (int i = 0; i < sz; i++)
-			klabels[i] = nlabels[i];
+		memcpy(klabels, nlabels, sz * sizeof(int));
 	}
+	endTime = Clock::now();
+	compTime = chrono::duration_cast<chrono::microseconds>(endTime - startTime);
+	std::cout << "EnforceLabelConnectivity time=" << compTime.count() / 1000 << " ms" << endl;
 	if (nlabels)
 		delete[] nlabels;
 }

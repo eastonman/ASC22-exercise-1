@@ -105,6 +105,7 @@ private:
 		const int &width,
 		const int &height,
 		vector<double> &edges);
+	double DetectLABPixelEdge(const int &i);
 
 	//============================================================================
 	// xRGB to XYZ conversion; helper for RGB2LAB()
