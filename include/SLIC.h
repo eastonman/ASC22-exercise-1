@@ -142,7 +142,7 @@ private:
 	// Post-processing of SLIC segmentation, to avoid stray labels.
 	//============================================================================
 	void EnforceLabelConnectivity(
-		const int *labels,
+		int *labels,
 		const int &width,
 		const int &height,
 		int *nlabels,	//input labels that need to be corrected to remove stray labels
@@ -163,6 +163,21 @@ private:
 	double **m_lvecvec;
 	double **m_avecvec;
 	double **m_bvecvec;
+};
+
+class area_info
+{
+public:
+	int index;
+	int x, y;
+	int count;
+	int new_label;
+	int seg_label;
+
+	bool operator<(const area_info &other)
+	{
+		return index < other.index;
+	}
 };
 
 #endif // !defined(_SLIC_H_INCLUDED_)
